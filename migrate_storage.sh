@@ -40,8 +40,8 @@ if [ $REMOVE_SOURCE -eq 1 ]; then
   DELETE_FLAG_VM="--delete 1"
   DELETE_FLAG_CT="--delete"      # flag only
 else
-  DELETE_FLAG_VM="--delete 0"
-  DELETE_FLAG_CT=""              # nothing
+  DELETE_FLAG_VM=""
+  DELETE_FLAG_CT=""
 fi
 
 # Best-effort storage validation
@@ -56,15 +56,14 @@ move_vm() {
   # Find all disks whose storage != DST
   local DISKS
   DISKS=$(qm config "$VMID" | awk -v dst="$DST" -F: '
-    /^(ide|sata|scsi|virtio|efidisk|tpmstate|unused)[0-9]+/ || /^mp[0-9]+/ {
+    /^(ide|sata|scsi|virtio|efidisk|tpmstate|unused)[0-9]+/ {
       key=$1
-      sub(/^[ \t]+/,"",key)
+      sub(/^[ \t]+/, "", key)
       val=$2
-      sub(/^[ \t]+/,"",val)
-      split(val,a,",")
-      # first segment is "storage:volname"
-      split(a[1],b,":")
-      storage=b[1]
+      sub(/^[ \t]+/, "", val)
+      split(val, a, ",")
+      # a[1] is "STORAGE" because of -F:
+      storage = a[1]
       if (storage != dst) {
         print key
       }
@@ -80,7 +79,7 @@ move_vm() {
   STATE=$(qm status "$VMID" | awk '{print $2}')
 
   if [ "$STATE" = "running" ]; then
-    echo "  VM $VMID is running - Proxmox may allow online move, otherwise it will error."
+    echo "  VM $VMID is running (may briefly pause during move)"
   fi
 
   for DISK in $DISKS; do
@@ -93,22 +92,31 @@ move_ct() {
   local CTID="$1"
   echo "ID $CTID is a CT"
 
-  # Find all volumes (rootfs/mpX) whose storage != DST, and only those that use storage:vol syntax
+  # Parse without -F: and detect storage:vol vs /path
   local VOLS
-  VOLS=$(pct config "$CTID" | awk -v dst="$DST" -F: '
-    /^rootfs/ || /^mp[0-9]+/ {
-      key=$1
-      sub(/^[ \t]+/,"",key)
-      val=$2
-      sub(/^[ \t]+/,"",val)
-      split(val,a,",")
-      # a[1] is first part: either "storage:vol" or "/path"
-      if (index(a[1], ":") == 0) {
-        # no "storage:vol" -> bind mount or local path, skip
+  VOLS=$(pct config "$CTID" | awk -v dst="$DST" '
+    /^rootfs:/ || /^mp[0-9]+:/ {
+      # key: "rootfs" or "mp0"
+      key = $1
+      sub(/:$/, "", key)
+
+      # strip "rootfs: " or "mpX: " from beginning
+      line = $0
+      sub(/^[^:]+:[ \t]*/, "", line)
+
+      # first comma-separated field is either "storage:vol" or "/path"
+      split(line, parts, ",")
+      first = parts[1]
+
+      # bind mount/local path: /something or relative path => skip
+      if (index(first, ":") == 0) {
         next
       }
-      split(a[1],b,":")
-      storage=b[1]
+
+      # storage:vol
+      split(first, sv, ":")
+      storage = sv[1]
+
       if (storage != dst) {
         print key
       }
@@ -129,7 +137,7 @@ move_ct() {
 
   for VOL in $VOLS; do
     echo "  CT $CTID: moving $VOL -> $DST"
-    pct move-volume "$CTID" "$VOL" $DELETE_FLAG_CT
+    pct move-volume "$CTID" "$VOL" "$DST" $DELETE_FLAG_CT
   done
 
   if [ $WAS_RUNNING -eq 1 ]; then
