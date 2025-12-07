@@ -1,15 +1,15 @@
 #!/bin/bash
-# move-storage.sh
+# migrate_storage.sh
 #
 # Usage:
-#   move-storage.sh <FROM_STORAGE> <TO_STORAGE> <ID1> [ID2 ...] [--remove-source]
+#   ./migrate_storage.sh <FROM_STORAGE> <TO_STORAGE> <ID1> [ID2 ...] [--remove-source]
 #
 # Examples:
 #   KEEP source:
-#     ./move-storage.sh HDD-ZFS-6TB SSD-ZFS-NAS 101 102 203
+#     ./migrate_storage.sh HDD-ZFS-4TB SSD-ZFS-NAS 100
 #
 #   DELETE source:
-#     ./move-storage.sh HDD-ZFS-6TB SSD-ZFS-NAS 101 102 --remove-source
+#     ./migrate_storage.sh HDD-ZFS-4TB SSD-ZFS-NAS 100 --remove-source
 
 set -o pipefail
 
@@ -22,18 +22,34 @@ SRC="$1"
 DST="$2"
 shift 2
 
-DELETE_FLAG="--delete 0"
-if [[ "$*" == *"--remove-source"* ]]; then
-  DELETE_FLAG="--delete 1"
-  # Remove flag from ID list
-  IDS=($(echo "$@" | sed 's/--remove-source//g'))
-else
-  IDS=("$@")
+REMOVE_SOURCE=0
+IDS=()
+
+for arg in "$@"; do
+  if [ "$arg" = "--remove-source" ]; then
+    REMOVE_SOURCE=1
+  else
+    IDS+=("$arg")
+  fi
+done
+
+if [ ${#IDS[@]} -eq 0 ]; then
+  echo "Error: no VM/CT IDs specified."
+  exit 1
 fi
 
 if [ "$SRC" = "$DST" ]; then
   echo "ERROR: FROM_STORAGE and TO_STORAGE are the same."
   exit 1
+fi
+
+# delete flag values
+if [ $REMOVE_SOURCE -eq 1 ]; then
+  DELETE_FLAG_VM="--delete 1"
+  DELETE_FLAG_CT="--delete 1"
+else
+  DELETE_FLAG_VM="--delete 0"
+  DELETE_FLAG_CT="--delete 0"
 fi
 
 # Storage validation (best effort)
@@ -44,19 +60,24 @@ move_vm() {
   local VMID="$1"
   echo "ID $VMID is a VM"
 
+  local DISKS
   DISKS=$(qm config "$VMID" | awk -v s="$SRC" -F: '$2 ~ " "s {gsub(/^[ \t]+/,"",$1); print $1}')
-  [ -z "$DISKS" ] && echo "  VM $VMID: no disks on $SRC, skipping." && return
 
+  if [ -z "$DISKS" ]; then
+    echo "  VM $VMID: no disks on $SRC, skipping."
+    return
+  fi
+
+  local STATE
   STATE=$(qm status "$VMID" | awk '{print $2}')
 
+  if [ "$STATE" = "running" ]; then
+    echo "  VM $VMID is running - you may see a brief pause while storage moves."
+  fi
+
   for DISK in $DISKS; do
-    if [ "$STATE" = "running" ]; then
-      echo "  VM $VMID: live-moving $DISK"
-      qm disk move "$VMID" "$DISK" "$DST" --online 1 $DELETE_FLAG
-    else
-      echo "  VM $VMID: offline-moving $DISK"
-      qm disk move "$VMID" "$DISK" "$DST" $DELETE_FLAG
-    fi
+    echo "  VM $VMID: moving $DISK from $SRC to $DST"
+    qm disk move "$VMID" "$DISK" "$DST" $DELETE_FLAG_VM
   done
 }
 
@@ -64,25 +85,37 @@ move_ct() {
   local CTID="$1"
   echo "ID $CTID is a CT"
 
+  local VOLS
   VOLS=$(pct config "$CTID" | awk -v s="$SRC" -F: '$2 ~ " "s {gsub(/^[ \t]+/,"",$1); print $1}')
-  [ -z "$VOLS" ] && echo "  CT $CTID: no volumes on $SRC, skipping." && return
 
-  WAS_RUNNING=0
-  pct status "$CTID" | grep -q "running" && WAS_RUNNING=1 && pct stop "$CTID"
+  if [ -z "$VOLS" ]; then
+    echo "  CT $CTID: no volumes on $SRC, skipping."
+    return
+  fi
+
+  local WAS_RUNNING=0
+  if pct status "$CTID" | grep -q "status: running"; then
+    WAS_RUNNING=1
+    echo "  CT $CTID: stopping for move"
+    pct stop "$CTID"
+  fi
 
   for VOL in $VOLS; do
-    echo "  CT $CTID: moving $VOL"
-    pct move-volume "$CTID" "$VOL" "$DST" $DELETE_FLAG
+    echo "  CT $CTID: moving $VOL from $SRC to $DST"
+    pct move-volume "$CTID" "$VOL" "$DST" $DELETE_FLAG_CT
   done
 
-  [ $WAS_RUNNING -eq 1 ] && pct start "$CTID"
+  if [ $WAS_RUNNING -eq 1 ]; then
+    echo "  CT $CTID: starting again"
+    pct start "$CTID"
+  fi
 }
 
 echo "=== MOVE JOB START ==="
 echo "FROM:   $SRC"
 echo "TO:     $DST"
-echo "DELETE: $([[ "$DELETE_FLAG" == "--delete 1" ]] && echo YES || echo NO)"
-echo "TARGET: ${IDS[*]}"
+echo "DELETE SOURCE: $([ $REMOVE_SOURCE -eq 1 ] && echo YES || echo NO)"
+echo "TARGET IDS: ${IDS[*]}"
 echo "======================="
 
 for ID in "${IDS[@]}"; do
