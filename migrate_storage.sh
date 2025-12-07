@@ -93,7 +93,7 @@ move_ct() {
   local CTID="$1"
   echo "ID $CTID is a CT"
 
-  # Find all volumes (rootfs/mpX) whose storage != DST
+  # Find all volumes (rootfs/mpX) whose storage != DST, and only those that use storage:vol syntax
   local VOLS
   VOLS=$(pct config "$CTID" | awk -v dst="$DST" -F: '
     /^rootfs/ || /^mp[0-9]+/ {
@@ -102,6 +102,11 @@ move_ct() {
       val=$2
       sub(/^[ \t]+/,"",val)
       split(val,a,",")
+      # a[1] is first part: either "storage:vol" or "/path"
+      if (index(a[1], ":") == 0) {
+        # no "storage:vol" -> bind mount or local path, skip
+        next
+      }
       split(a[1],b,":")
       storage=b[1]
       if (storage != dst) {
@@ -111,7 +116,7 @@ move_ct() {
   ')
 
   if [ -z "$VOLS" ]; then
-    echo "  CT $CTID: all volumes already on $DST, nothing to move."
+    echo "  CT $CTID: all movable volumes already on $DST, nothing to move."
     return
   fi
 
@@ -124,7 +129,7 @@ move_ct() {
 
   for VOL in $VOLS; do
     echo "  CT $CTID: moving $VOL -> $DST"
-    pct move-volume "$CTID" "$VOL" "$DST" $DELETE_FLAG_CT
+    pct move-volume "$CTID" "$VOL" $DELETE_FLAG_CT
   done
 
   if [ $WAS_RUNNING -eq 1 ]; then
